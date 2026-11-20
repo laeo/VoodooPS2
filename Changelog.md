@@ -1,5 +1,10 @@
 VoodooPS2 Changelog
 ============================
+#### v2.3.8 (ps2ro local build)
+- Local experiment: added `ps2ro` restricted/read-only controller mode
+  (`ps2ro=1/2` strict read-only, `ps2ro=3` keyboard-only + one controller CTR write)
+- Not an upstream release; bundle identifier unchanged
+
 #### v2.3.7
 - Fixed multiple PS2/SMBus devices attaching
 - Fixed eratic pointer in bootpicker by disabling SMBus/PS2 devices on shutdown 

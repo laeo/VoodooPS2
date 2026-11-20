@@ -373,8 +373,42 @@ IOReturn ApplePS2Controller::setProperties(OSObject* props)
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
+void ApplePS2Controller::ps2roPublishStats()
+{
+    setProperty("ps2ro-mode", (unsigned long long)_ps2roMode, 32);
+    setProperty("ps2ro-blocked-writes", (unsigned long long)_ps2roBlockedWrites, 32);
+    setProperty("ps2ro-ctr-writes", (unsigned long long)_ps2roCtrWrites, 32);
+    setProperty("ps2ro-forbidden-dp-writes", (unsigned long long)_ps2roForbiddenDpWrites, 32);
+    setProperty("ps2ro-allowed-dp-writes", (unsigned long long)_ps2roAllowedDpWrites, 32);
+}
+
+void ApplePS2Controller::ps2roCountBlocked(const char *what, int value)
+{
+    ++_ps2roBlockedWrites;
+    if (value >= 0)
+        IOLog("%s: ps2ro blocked %s write #%u (byte 0x%02x)\n",
+              getName(), what, (unsigned)_ps2roBlockedWrites, value & 0xff);
+    else
+        DEBUG_LOG("%s: ps2ro blocked %s write #%u\n", getName(), what, (unsigned)_ps2roBlockedWrites);
+    ps2roPublishStats();
+}
+
+void ApplePS2Controller::ps2roCountAllowed(const char *what, int value)
+{
+    ++_ps2roAllowedDpWrites;
+    IOLog("%s: ps2ro allowed %s write #%u (byte 0x%02x)\n",
+          getName(), what, (unsigned)_ps2roAllowedDpWrites, value & 0xff);
+    ps2roPublishStats();
+}
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
 void ApplePS2Controller::resetController()
 {
+    if (_readOnly) {
+        ps2roCountBlocked("resetController");
+        return;
+    }
     _suppressTimeout = true;
     UInt8 commandByte;
     
@@ -425,6 +459,10 @@ void ApplePS2Controller::resetController()
 
 void ApplePS2Controller::resetDevices()
 {
+    if (_readOnly) {
+        ps2roCountBlocked("resetDevices");
+        return;
+    }
     // Reset keyboard
     writeDataPort(kDP_SetDefaultsAndDisable);
     readDataPort(kPS2KbdIdx);       // (discard acknowledge; success irrelevant)
@@ -465,6 +503,10 @@ void ApplePS2Controller::flushDataPort()
 
 bool ApplePS2Controller::setMuxMode(bool enable)
 {
+    if (_readOnly) {
+        ps2roCountBlocked("setMuxMode");
+        return false;
+    }
     UInt8 param = kDP_MuxCmd;
 
     writeCommandPort(kCP_WriteMouseOutputBuffer);
@@ -527,7 +569,32 @@ bool ApplePS2Controller::start(IOService * provider)
   //
     
   PE_parse_boot_argn("ps2rst", &_resetControllerFlag, sizeof(_resetControllerFlag));
-  if (_resetControllerFlag & RESET_CONTROLLER_ON_BOOT) {
+
+  //
+  // ps2ro: restricted/read-only controller mode (see header).
+  // Parsed after ps2kbdonly/ps2rst so that mode 3 can force keyboard-only and
+  // disable all reset paths regardless of the other boot arguments.
+  //
+  {
+    int ps2roMode = 0;
+    PE_parse_boot_argn("ps2ro", &ps2roMode, sizeof(ps2roMode));
+    if (ps2roMode < 0)
+      ps2roMode = 0;
+    if (ps2roMode > 4)
+      ps2roMode = 1; // unknown modes fall back to strict read-only
+    _ps2roMode = ps2roMode;
+    _readOnly = (ps2roMode != 0);
+    if (_ps2roMode == 3 || _ps2roMode == 4) {
+      _kbdOnly = true;
+      _resetControllerFlag = 0;
+    }
+    IOLog("%s: ps2ro mode %d (readOnly=%d kbdOnly=%d resetFlag=0x%x)\n",
+          getName(), _ps2roMode, _readOnly ? 1 : 0, _kbdOnly ? 1 : 0,
+          (unsigned)_resetControllerFlag);
+    ps2roPublishStats();
+  }
+
+  if (!_readOnly && (_resetControllerFlag & RESET_CONTROLLER_ON_BOOT)) {
     resetController();
   }
 
@@ -549,7 +616,7 @@ bool ApplePS2Controller::start(IOService * provider)
   // before starting up the work loop.
   //
   
-  if (_resetControllerFlag & RESET_CONTROLLER_ON_BOOT) {
+  if (!_readOnly && (_resetControllerFlag & RESET_CONTROLLER_ON_BOOT)) {
     resetDevices();
     flushDataPort();
   }
@@ -795,6 +862,9 @@ IOWorkLoop * ApplePS2Controller::getWorkLoop() const
 
 void ApplePS2Controller::enableMuxPorts()
 {
+  if (_readOnly || _kbdOnly)
+    return;
+
   for (size_t i = 0; i < PS2_MUX_PORTS; i++)
   {
     writeCommandPort(kCP_TransmitToMuxedMouse + i);
@@ -819,9 +889,39 @@ void ApplePS2Controller::installInterruptAction(size_t port)
   
   if (port == kPS2KbdIdx && !_interruptInstalledKeyboard)
   {
-    DEBUG_LOG("%s: setCommandByte for keyboard interrupt install\n", getName());
-    setCommandByte(kCB_EnableKeyboardIRQ, 0);
-    
+    if (_ps2roMode == 3 || _ps2roMode == 4)
+    {
+      // ps2ro=3/4: allow exactly one controller command-byte write.  This is the
+      // only CTR write that reaches the hardware in these modes; all
+      // non-allowlisted keyboard data-port commands and plugin-issued
+      // setCommandByte() calls are rejected elsewhere.
+      if (!_ps2roCtrWriteDone)
+      {
+        DEBUG_LOG("%s: ps2ro=%d single CTR write for keyboard interrupt install\n", getName(), _ps2roMode);
+        _ps2roInternalCtrWrite = true;
+        setCommandByte(kCB_EnableKeyboardIRQ | kCB_TranslateMode, kCB_DisableKeyboardClock);
+        _ps2roInternalCtrWrite = false;
+        _ps2roCtrWriteDone = true;
+        ps2roPublishStats();
+      }
+    }
+    else if (_ps2roMode == 1)
+    {
+      // ps2ro=1: strict read-only, do not touch CTR at all.
+      DEBUG_LOG("%s: ps2ro=1 skipping CTR write for keyboard interrupt install\n", getName());
+    }
+    else if (_ps2roMode == 2)
+    {
+      // TODO(ps2ro=2): reserved strict read-only variant.  Currently treated
+      // like mode 1 (register the IRQ without any CTR write).
+      DEBUG_LOG("%s: ps2ro=2 skipping CTR write for keyboard interrupt install (TODO)\n", getName());
+    }
+    else
+    {
+      DEBUG_LOG("%s: setCommandByte for keyboard interrupt install\n", getName());
+      setCommandByte(kCB_EnableKeyboardIRQ, 0);
+    }
+
     getProvider()->registerInterrupt(kIRQ_Keyboard,0, interruptHandlerKeyboard, this);
     getProvider()->enableInterrupt(kIRQ_Keyboard);
     
@@ -838,7 +938,10 @@ void ApplePS2Controller::installInterruptAction(size_t port)
         enableMuxPorts();
       }
       
-      setCommandByte(kCB_EnableMouseIRQ, 0);
+      if (!_readOnly)
+        setCommandByte(kCB_EnableMouseIRQ, 0);
+      else
+        ps2roCountBlocked("mouse-install-CTR");
         
       getProvider()->registerInterrupt(kIRQ_Mouse, 0, interruptHandlerMouse, this);
       getProvider()->enableInterrupt(kIRQ_Mouse);
@@ -866,7 +969,10 @@ void ApplePS2Controller::uninstallInterruptAction(size_t port)
 
   if (port == kPS2KbdIdx && _interruptInstalledKeyboard)
   {
-    setCommandByte(0, kCB_EnableKeyboardIRQ);
+    if (!_readOnly)
+      setCommandByte(0, kCB_EnableKeyboardIRQ);
+    else
+      DEBUG_LOG("%s: ps2ro skipping CTR write on keyboard interrupt uninstall\n", getName());
     getProvider()->disableInterrupt(kIRQ_Keyboard);
     getProvider()->unregisterInterrupt(kIRQ_Keyboard);
     _interruptInstalledKeyboard = false;
@@ -879,7 +985,10 @@ void ApplePS2Controller::uninstallInterruptAction(size_t port)
     
     // Only uninstall interrupt once we have no mice installed
     if (_interruptInstalledMouse == 0) {
-      setCommandByte(0, kCB_EnableMouseIRQ);
+      if (!_readOnly)
+        setCommandByte(0, kCB_EnableMouseIRQ);
+      else
+        DEBUG_LOG("%s: ps2ro skipping CTR write on mouse interrupt uninstall\n", getName());
       getProvider()->disableInterrupt(kIRQ_Mouse);
       getProvider()->unregisterInterrupt(kIRQ_Mouse);
     }
@@ -943,6 +1052,14 @@ UInt8 ApplePS2Controller::setCommandByte(UInt8 setBits, UInt8 clearBits)
 
 void ApplePS2Controller::setCommandByteGated(PS2Request* request)
 {
+    if (_readOnly && !_ps2roInternalCtrWrite)
+    {
+        // ps2ro: reject command-byte writes coming from device clients.
+        ps2roCountBlocked("setCommandByte");
+        request->commands[0].oldBits = 0;
+        return;
+    }
+
     UInt8 setBits = request->commands[0].setBits;
     UInt8 clearBits = request->commands[0].clearBits;
     ++_ignoreInterrupts;
@@ -956,6 +1073,11 @@ void ApplePS2Controller::setCommandByteGated(PS2Request* request)
         DEBUG_LOG("%s: newCommandByte = %02x\n", getName(), newCommandByte);
         writeCommandPort(kCP_SetCommandByte);
         writeDataPort(newCommandByte);
+        if (_ps2roInternalCtrWrite)
+        {
+            ++_ps2roCtrWrites;
+            ps2roPublishStats();
+        }
     }
     request->commands[0].oldBits = oldCommandByte;
 }
@@ -1104,6 +1226,26 @@ void ApplePS2Controller::processRequest(PS2Request * request)
   bool          failed          = false;
   unsigned      index;
 
+  _ps2roEdParamPending = false;
+  _ps2roDpWriteAllowed = false;
+
+  auto ps2roAllowDataWrite = [&](UInt8 value) -> bool {
+    if (!_readOnly)
+      return true;
+    if (_ps2roMode != 4 || devicePort != kPS2KbdIdx)
+      return false;
+    if (value == 0xED) {
+      // 0xED (Set LEDs) is followed by one parameter byte.
+      _ps2roEdParamPending = true;
+      return true;
+    }
+    if (_ps2roEdParamPending) {
+      _ps2roEdParamPending = false;
+      return true;
+    }
+    return (value == 0xF6 || value == 0xF4);
+  };
+
   if (_hardwareOffline)
   {
     failed = true;
@@ -1137,6 +1279,14 @@ void ApplePS2Controller::processRequest(PS2Request * request)
         break;
 
       case kPS2C_WriteDataPort:
+        if (_readOnly && !ps2roAllowDataWrite(request->commands[index].inOrOut)) {
+          // ps2ro=1/2/3: block every data-port command.  ps2ro=4: block
+          // everything except 0xF6/0xED(+parameter)/0xF4; 0xF5 and 0xEE stay
+          // blocked in all read-only modes.
+          ps2roCountBlocked("data-port", request->commands[index].inOrOut);
+          failed = true;
+          break;
+        }
         if (devicePort >= kPS2AuxIdx) {
           if (_muxPresent) {
             writeCommandPort(kCP_TransmitToMuxedMouse + (devicePort - kPS2AuxIdx));
@@ -1144,8 +1294,10 @@ void ApplePS2Controller::processRequest(PS2Request * request)
             writeCommandPort(kCP_TransmitToMouse);
           }
         }
-        
+
+        _ps2roDpWriteAllowed = (_readOnly && _ps2roMode == 4);
         writeDataPort(request->commands[index].inOrOut);
+        _ps2roDpWriteAllowed = false;
         break;
 
       //
@@ -1157,6 +1309,11 @@ void ApplePS2Controller::processRequest(PS2Request * request)
       //
 
       case kPS2C_SendCommandAndCompareAck:
+        if (_readOnly && !ps2roAllowDataWrite(request->commands[index].inOrOut)) {
+          ps2roCountBlocked("data-port-ack", request->commands[index].inOrOut);
+          failed = true;
+          break;
+        }
         if (devicePort >= kPS2AuxIdx) {
           if (_muxPresent) {
             writeCommandPort(kCP_TransmitToMuxedMouse + (devicePort - kPS2AuxIdx));
@@ -1164,8 +1321,10 @@ void ApplePS2Controller::processRequest(PS2Request * request)
             writeCommandPort(kCP_TransmitToMouse);
           }
         }
-        
+
+        _ps2roDpWriteAllowed = (_readOnly && _ps2roMode == 4);
         writeDataPort(request->commands[index].inOrOut);
+        _ps2roDpWriteAllowed = false;
 #if OUT_OF_ORDER_DATA_CORRECTION_FEATURE
         byte = readDataPort(devicePort, kSC_Acknowledge);
 #else 
@@ -1190,10 +1349,29 @@ void ApplePS2Controller::processRequest(PS2Request * request)
         break;
             
       case kPS2C_ModifyCommandByte:
+        if (_readOnly && !_ps2roInternalCtrWrite) {
+          ps2roCountBlocked("modify-command-byte");
+          request->commands[index].oldBits = 0;
+          failed = true;
+          break;
+        }
         writeCommandPort(kCP_GetCommandByte);
         UInt8 commandByte = readDataPort(kPS2KbdIdx);
-        writeCommandPort(kCP_SetCommandByte);
-        writeDataPort((commandByte | request->commands[index].setBits) & ~request->commands[index].clearBits);
+        {
+          UInt8 newCommandByte = (commandByte | request->commands[index].setBits) & ~request->commands[index].clearBits;
+          if (_ps2roInternalCtrWrite) {
+            if (commandByte != newCommandByte) {
+              writeCommandPort(kCP_SetCommandByte);
+              writeDataPort(newCommandByte);
+              ++_ps2roCtrWrites;
+              ps2roPublishStats();
+            }
+          } else {
+            // Preserve upstream behaviour for the normal (non-ps2ro) path.
+            writeCommandPort(kCP_SetCommandByte);
+            writeDataPort(newCommandByte);
+          }
+        }
         request->commands[index].oldBits = commandByte;
         break;
     }
@@ -1211,6 +1389,11 @@ hardware_offline:
   // index into the commandsCount field.
 
   if (failed) request->commandsCount = index;
+
+  // Do not let a half-processed request leak an allow/ED-parameter state into
+  // the next request.
+  _ps2roEdParamPending = false;
+  _ps2roDpWriteAllowed = false;
 
   // Invoke the completion routine, if one was supplied.
 
@@ -1537,6 +1720,40 @@ skipForwardToY:
 
 void ApplePS2Controller::writeDataPort(UInt8 byte)
 {
+  // ps2ro hard guard.  0xF5 (Set Defaults and Disable) and 0xEE (Test Echo)
+  // stay blocked in every read-only mode.  In mode 4, 0xF6/0xED/0xF4 (plus
+  // the single 0xED parameter byte) are allowed only when processRequest set
+  // _ps2roDpWriteAllowed for this exact write.
+  if (_readOnly)
+  {
+    bool isFive = (byte == 0xF5 || byte == 0xF6 || byte == 0xF4 ||
+                   byte == 0xED || byte == 0xEE);
+    bool hardBlocked = (byte == 0xF5 || byte == 0xEE);
+    if (!hardBlocked && _ps2roMode != 4 && isFive)
+      hardBlocked = true;
+    if (!hardBlocked && _ps2roMode == 4 && !_ps2roDpWriteAllowed &&
+        !_ps2roInternalCtrWrite)
+      hardBlocked = true;
+
+    if (hardBlocked)
+    {
+      ++_ps2roForbiddenDpWrites;
+      IOLog("%s: ps2ro HARD-BLOCKED data-port byte 0x%02x (#%u)\n",
+            getName(), byte, (unsigned)_ps2roForbiddenDpWrites);
+      ps2roPublishStats();
+      return;
+    }
+
+    if (_ps2roMode == 4 && _ps2roDpWriteAllowed)
+      ps2roCountAllowed("data-port", byte);
+  }
+
+  if (ps2roStrictReadOnly())
+  {
+    ps2roCountBlocked("data-port-lowlevel");
+    return;
+  }
+
   //
   // Block until room in the controller's input buffer is available, then
   // write the given byte to the Data Port.
@@ -1554,6 +1771,12 @@ void ApplePS2Controller::writeDataPort(UInt8 byte)
 
 void ApplePS2Controller::writeCommandPort(UInt8 byte)
 {
+  if (ps2roStrictReadOnly())
+  {
+    ps2roCountBlocked("command-port-lowlevel");
+    return;
+  }
+
   //
   // Block until room in the controller's input buffer is available, then
   // write the given byte to the Command Port.
@@ -1821,6 +2044,57 @@ IOReturn ApplePS2Controller::setPowerStateAction( OSObject * target,
 
 void ApplePS2Controller::setPowerStateGated( UInt32 powerState )
 {
+  if (_readOnly)
+  {
+    // ps2ro: never touch the controller/device ports on power transitions.
+    // Only maintain the software state so clients still observe sleep/wake.
+    if ( _currentPowerState != powerState )
+    {
+      switch ( powerState )
+      {
+        case kPS2PowerStateSleep:
+          ++_ignoreInterrupts;
+          dispatchDriverPowerControl( kPS2C_DisableDevice, kPS2AuxIdx );
+          dispatchDriverPowerControl( kPS2C_DisableDevice, kPS2KbdIdx );
+          _hardwareOffline = true;
+          break;
+
+        case kPS2PowerStateDoze:
+        case kPS2PowerStateNormal:
+          if ( _currentPowerState != kPS2PowerStateSleep )
+            break;
+
+          if (_wakedelay)
+            IOSleep(_wakedelay);
+
+          _hardwareOffline = false;
+
+          if (!_mouseWakeFirst)
+          {
+            dispatchDriverPowerControl( kPS2C_EnableDevice, kPS2KbdIdx );
+            dispatchDriverPowerControl( kPS2C_EnableDevice, kPS2AuxIdx );
+          }
+          else
+          {
+            dispatchDriverPowerControl( kPS2C_EnableDevice, kPS2AuxIdx );
+            dispatchDriverPowerControl( kPS2C_EnableDevice, kPS2KbdIdx );
+          }
+
+          --_ignoreInterrupts;
+          break;
+
+        default:
+          IOLog("%s: bad power state %ld\n", getName(), (long)powerState);
+          break;
+      }
+
+      _currentPowerState = powerState;
+    }
+
+    acknowledgeSetPowerState();
+    return;
+  }
+
   if ( _currentPowerState != powerState )
   {
     switch ( powerState )

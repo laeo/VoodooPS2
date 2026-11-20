@@ -287,6 +287,31 @@ private:
   int                      _resetControllerFlag {RESET_CONTROLLER_ON_BOOT | RESET_CONTROLLER_ON_WAKEUP};
   bool                     _kbdOnly {0};
 
+  // ps2ro: read-only / restricted PS/2 controller mode.
+  //   0 = disabled (upstream behaviour)
+  //   1 = strict read-only: no controller or device writes at all
+  //   2 = strict read-only, reserved (same low-level policy as 1 for now)
+  //   3 = keyboard-only: block all keyboard data-port commands, allow exactly
+  //       one controller command-byte (CTR) write in installInterruptAction()
+  //   4 = keyboard-only: like 3, but allow the keyboard data-port commands
+  //       0xF6 (Set Defaults), 0xED (Set LEDs + its parameter byte) and
+  //       0xF4 (Enable); still hard-block 0xF5 and 0xEE.
+  int                      _ps2roMode {0};
+  bool                     _readOnly {false};
+  bool                     _ps2roInternalCtrWrite {false};
+  bool                     _ps2roCtrWriteDone {false};
+  UInt32                   _ps2roBlockedWrites {0};
+  UInt32                   _ps2roCtrWrites {0};
+  UInt32                   _ps2roForbiddenDpWrites {0};
+  UInt32                   _ps2roAllowedDpWrites {0};
+  bool                     _ps2roDpWriteAllowed {false};
+  bool                     _ps2roEdParamPending {false};
+
+  bool ps2roStrictReadOnly() const { return _ps2roMode == 1 || _ps2roMode == 2; }
+  void ps2roCountBlocked(const char *what, int value = -1);
+  void ps2roCountAllowed(const char *what, int value);
+  void ps2roPublishStats();
+
   virtual PS2InterruptResult _dispatchDriverInterrupt(size_t port, UInt8 data);
   virtual void dispatchDriverInterrupt(size_t port, UInt8 data);
 #if HANDLE_INTERRUPT_DATA_LATER
